@@ -1,6 +1,6 @@
 {
   "name": "@ramlyburger/gpt-image-2-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "MCP server for GPT Image 2 with selectable OpenAI API and ChatGPT web backends.",
   "type": "module",
   "bin": {
@@ -10,7 +10,9 @@
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "npm run build && node scripts/smoke-test.mjs && node scripts/web-fixture-test.mjs && node scripts/web-session-test.mjs",
+    "test:live": "npm run build && node scripts/live-web-test.mjs"
   },
   "files": [
     "dist",

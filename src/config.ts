@@ -42,6 +42,7 @@ export function defaultProfileDir(env: NodeJS.ProcessEnv = process.env, platform
 export interface AppConfig {
   defaultBackend: BackendSelection;
   outputRoot: string;
+  warnings: string[];
   api: {
     apiKey?: string;
     model: string;
@@ -50,24 +51,37 @@ export interface AppConfig {
     profileDir: string;
     loginTimeoutSeconds: number;
     hideWindow: boolean;
+    eagerStart: boolean;
+    idleCloseSeconds: number;
   };
 }
 
-function parseBackend(value: string | undefined): BackendSelection {
+function parseBackend(value: string | undefined, warnings: string[]): BackendSelection {
   const parsed = BackendSelectionSchema.safeParse(value || "api");
-  return parsed.success ? parsed.data : "api";
+  if (!parsed.success) {
+    warnings.push(`GPT_IMAGE_BACKEND="${value}" is not one of api, chatgpt-web, auto; using api.`);
+    return "api";
+  }
+  return parsed.data;
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) {
+
+const MAX_TIMER_SECONDS = 2_147_483;
+
+function parseInteger(name: string, value: string | undefined, fallback: number, minimum: number, warnings: string[]): number {
+  if (value === undefined || value.trim() === "") {
     return fallback;
   }
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  const parsed = /^\d+$/.test(value.trim()) ? Number(value.trim()) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > MAX_TIMER_SECONDS) {
+    warnings.push(`${name}="${value}" is not a whole number from ${minimum} to ${MAX_TIMER_SECONDS}; using ${fallback}.`);
+    return fallback;
+  }
+  return parsed;
 }
 
-function parseBoolean(value: string | undefined, fallback: boolean): boolean {
-  if (value === undefined) {
+function parseBoolean(name: string, value: string | undefined, fallback: boolean, warnings: string[]): boolean {
+  if (value === undefined || value.trim() === "") {
     return fallback;
   }
   const normalized = value.trim().toLowerCase();
@@ -77,21 +91,26 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (["0", "false", "no", "off"].includes(normalized)) {
     return false;
   }
+  warnings.push(`${name}="${value}" is not one of 1, 0, true, false, yes, no, on, off; using ${fallback ? "1" : "0"}.`);
   return fallback;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const warnings: string[] = [];
   return {
-    defaultBackend: parseBackend(env.GPT_IMAGE_BACKEND),
-    outputRoot: defaultOutputRoot(env),
+    defaultBackend: parseBackend(env.GPT_IMAGE_BACKEND, warnings),
+    outputRoot: path.resolve(env.GPT_IMAGE_OUTPUT_DIR || defaultOutputRoot(env)),
+    warnings,
     api: {
       apiKey: env.OPENAI_API_KEY,
       model: env.GPT_IMAGE_MODEL || "gpt-image-2",
     },
     web: {
       profileDir: path.resolve(env.CHATGPT_WEB_PROFILE_DIR || defaultProfileDir(env)),
-      loginTimeoutSeconds: parsePositiveInt(env.CHATGPT_WEB_LOGIN_TIMEOUT_SECONDS, 900),
-      hideWindow: parseBoolean(env.CHATGPT_HIDE_WINDOW, true),
+      loginTimeoutSeconds: parseInteger("CHATGPT_WEB_LOGIN_TIMEOUT_SECONDS", env.CHATGPT_WEB_LOGIN_TIMEOUT_SECONDS, 900, 1, warnings),
+      hideWindow: parseBoolean("CHATGPT_HIDE_WINDOW", env.CHATGPT_HIDE_WINDOW, true, warnings),
+      eagerStart: parseBoolean("CHATGPT_WEB_EAGER_START", env.CHATGPT_WEB_EAGER_START, false, warnings),
+      idleCloseSeconds: parseInteger("CHATGPT_WEB_IDLE_CLOSE_SECONDS", env.CHATGPT_WEB_IDLE_CLOSE_SECONDS, 600, 0, warnings),
     },
   };
 }

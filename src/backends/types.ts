@@ -15,7 +15,10 @@ export interface GenerateImageArgs {
   quality?: ImageQuality;
   outputFormat: OutputFormat;
   conversationMode: ConversationMode;
+  conversationUrl?: string;
+  referenceImages?: string[];
   timeoutSeconds: number;
+  signal?: AbortSignal;
 }
 
 export interface GeneratedImage {
@@ -33,6 +36,7 @@ export interface GenerateImageResult {
   outputDir: string;
   images: GeneratedImage[];
   primaryImage: GeneratedImage;
+  warnings?: string[];
   metadata?: Record<string, unknown>;
 }
 
