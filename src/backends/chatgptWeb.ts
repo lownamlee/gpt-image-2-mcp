@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -24,7 +24,7 @@ const execFileAsync = promisify(execFile);
 interface PageState {
   title: string;
   url: string;
-  text: string;
+  challenge?: boolean;
 }
 
 interface BrowserImage {
@@ -110,6 +110,7 @@ interface DirectSessionStatus {
   hide_method?: string;
   hide_error?: string;
   current_url?: string;
+  last_conversation_url?: string;
   last_error?: string;
 }
 
@@ -150,7 +151,14 @@ export class ChatGptWebBackend implements ImageBackend {
       timeoutSeconds: args.timeoutSeconds,
       maxImages: args.n,
       conversationMode: args.conversationMode,
+      conversationUrl: args.conversationUrl,
+      referenceImages: args.referenceImages,
+      signal: args.signal,
     });
+  }
+
+  collect(params: { conversationUrl: string; timeoutSeconds: number; maxImages: number; signal?: AbortSignal }): Promise<GenerateImageResult> {
+    return this.directSession.collect(params);
   }
 
   async close(): Promise<void> {
@@ -179,6 +187,12 @@ class DirectChatGptBrowserSession {
   private showError?: string;
   private lastVisibleBounds?: Record<string, unknown>;
   private blankPageCleanupContext?: BrowserContext;
+  private busy = false;
+  private idleTimer?: NodeJS.Timeout;
+  private releaseWatcher?: NodeJS.Timeout;
+  private launchedAt = 0;
+  private lastConversationUrl?: string;
+  private lastReadinessReason?: string;
 
   constructor(private readonly config: AppConfig) {
     this.hideWindowEnabled = config.web.hideWindow;
@@ -193,7 +207,7 @@ class DirectChatGptBrowserSession {
   }
 
   async status(): Promise<DirectSessionStatus> {
-    if (this.browserOpen && !this.startup) {
+    if (this.browserOpen && !this.startup && !this.busy) {
       try {
         await this.refreshChatReadiness("status");
       } catch (error) {
@@ -218,6 +232,7 @@ class DirectChatGptBrowserSession {
       hide_method: this.hideMethod,
       hide_error: this.hideError,
       current_url: this.browserOpen ? safePageUrl(this.page) : undefined,
+      last_conversation_url: this.lastConversationUrl,
       last_error: this.lastError,
     };
   }
@@ -231,20 +246,26 @@ class DirectChatGptBrowserSession {
     }
     if (!this.startup) {
       this.lastError = undefined;
-      this.startup = this.ensureStarted()
+      const startup: Promise<void> = this.ensureStarted()
         .catch((error) => {
-          this.lastError = error instanceof Error ? error.message : String(error);
+          if (this.startup === startup) {
+            this.lastError = error instanceof Error ? error.message : String(error);
+          }
           throw error;
         })
         .finally(() => {
-          this.startup = undefined;
+          if (this.startup === startup) {
+            this.startup = undefined;
+          }
+          this.scheduleIdleClose();
         });
+      this.startup = startup;
     }
     return this.startup;
   }
 
   async browserVisibility(options: BrowserVisibilityOptions): Promise<BrowserVisibilityStatus> {
-    return this.runExclusive(async () => {
+    {
       const requestedAction = options.action;
       let appliedAction: "show" | "hide" | undefined;
       let message = "Browser visibility status returned.";
@@ -258,7 +279,7 @@ class DirectChatGptBrowserSession {
       if (appliedAction === "show") {
         this.hideWindowEnabled = false;
         if (!this.browserOpen && options.startBrowser) {
-          await this.start();
+          await this.openBrowserWithoutWaitingForSignIn();
         }
         if (this.browserOpen && this.page) {
           await this.showBrowserWindow();
@@ -269,9 +290,11 @@ class DirectChatGptBrowserSession {
       } else if (appliedAction === "hide") {
         this.hideWindowEnabled = true;
         if (!this.browserOpen && options.startBrowser) {
-          await this.start();
+          await this.openBrowserWithoutWaitingForSignIn();
         } else if (this.browserOpen && this.page) {
-          await this.refreshChatReadiness("visibility-hide");
+          if (!this.busy) {
+            await this.refreshChatReadiness("visibility-hide");
+          }
           if (this.hideReady) {
             await this.hideWindowIfConfigured("visibility-hide");
           }
@@ -286,12 +309,45 @@ class DirectChatGptBrowserSession {
         } else {
           message = "Browser hide was requested, but the browser could not be hidden.";
         }
-      } else if (this.browserOpen) {
+      } else if (!this.browserOpen && options.startBrowser) {
+        await this.openBrowserWithoutWaitingForSignIn();
+        message = "Browser started.";
+      } else if (this.browserOpen && !this.busy) {
         await this.refreshChatReadiness("visibility-status");
       }
 
+      if (this.browserOpen && this.startup) {
+        message = `${message} Waiting for ChatGPT sign-in in the browser window.`;
+      }
+      if (this.browserOpen && !this.busy) {
+        this.scheduleIdleClose();
+      }
       return this.visibilityStatus(requestedAction, appliedAction, message);
-    });
+    }
+  }
+
+  private async openBrowserWithoutWaitingForSignIn(): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    await acquireProfile(
+      this.config.web.profileDir,
+      deadline,
+      undefined,
+      async () => {
+        const startup = this.start();
+        let settled = false;
+        startup.then(
+          () => (settled = true),
+          () => (settled = true),
+        );
+        while (!this.browserOpen && !settled && Date.now() < deadline) {
+          await sleep(250);
+        }
+        if (settled) {
+          await startup;
+        }
+      },
+      () => new Error("Timed out opening the ChatGPT browser window."),
+    );
   }
 
   async generate(params: {
@@ -299,32 +355,153 @@ class DirectChatGptBrowserSession {
     timeoutSeconds: number;
     maxImages: number;
     conversationMode: "new" | "continue";
+    conversationUrl?: string;
+    referenceImages?: string[];
+    signal?: AbortSignal;
   }): Promise<GenerateImageResult> {
-    await this.start();
-    if (!this.page) {
-      throw new BackendUnavailableError("TypeScript ChatGPT browser session did not start.", "chatgpt-web");
-    }
-    const page = this.page;
-    return this.runExclusive(async () => {
-      await this.waitForComposerWithHide(page, this.config.web.loginTimeoutSeconds, "before-generate");
-      await this.hideWindowIfConfigured("before-generate");
-      return sendPromptAndExport(page, this.config, {
-        prompt: params.prompt,
-        timeoutSeconds: params.timeoutSeconds,
-        maxImages: params.maxImages,
-        conversationMode: params.conversationMode,
-        sessionReused: true,
-      });
+    const deadline = Date.now() + params.timeoutSeconds * 1000;
+    return this.withReadyPage(deadline, params.signal, async (page) => {
+      const conversationUrl =
+        params.conversationUrl ??
+        (params.conversationMode === "continue" && !isConversationUrl(safePageUrl(page)) ? this.lastConversationUrl : undefined);
+      try {
+        return await sendPromptAndExport(page, this.config, {
+          prompt: params.prompt,
+          deadline,
+          maxImages: params.maxImages,
+          conversationMode: params.conversationMode,
+          conversationUrl,
+          referenceImages: params.referenceImages,
+          signal: params.signal,
+          onBlocked: () => this.revealForVerification(),
+        });
+      } finally {
+        const url = safePageUrl(page);
+        if (isConversationUrl(url)) {
+          this.lastConversationUrl = url;
+        }
+      }
     });
   }
 
+  async collect(params: { conversationUrl: string; timeoutSeconds: number; maxImages: number; signal?: AbortSignal }): Promise<GenerateImageResult> {
+    const deadline = Date.now() + params.timeoutSeconds * 1000;
+    return this.withReadyPage(deadline, params.signal, (page) =>
+      collectConversationImages(page, this.config, {
+        conversationUrl: params.conversationUrl,
+        deadline,
+        maxImages: params.maxImages,
+        signal: params.signal,
+        onBlocked: () => this.revealForVerification(),
+      }),
+    );
+  }
+
+  private async revealForVerification(): Promise<void> {
+    this.hideReady = false;
+    if (this.hidden) {
+      await this.showBrowserWindow();
+    }
+  }
+
+  private async withReadyPage<T>(deadline: number, signal: AbortSignal | undefined, task: (page: Page) => Promise<T>): Promise<T> {
+    this.cancelIdleClose();
+    return this.runExclusive(signal, deadline, async () => {
+      this.busy = true;
+      try {
+        await this.startWaitingForProfile(deadline, signal);
+        const page = this.page;
+        if (!page) {
+          throw new BackendUnavailableError("ChatGPT browser session did not start.", "chatgpt-web");
+        }
+        await this.waitForComposerWithHide(page, deadline, "before-generate", signal);
+        await this.hideWindowIfConfigured("before-generate");
+        return await task(page);
+      } finally {
+        this.busy = false;
+        await this.refreshChatReadiness("after-generate").catch(() => undefined);
+        this.scheduleIdleClose();
+      }
+    });
+  }
+
+  private async startWaitingForProfile(deadline: number, signal: AbortSignal | undefined): Promise<void> {
+    await acquireProfile(
+      this.config.web.profileDir,
+      deadline,
+      signal,
+      () => this.start(),
+      () =>
+        this.lastReadinessReason === "verification-or-security-check"
+          ? new LoginRequiredError("ChatGPT is showing a verification check. Complete it in the ChatGPT browser window (browser_visibility show displays it), then call again.")
+          : new LoginRequiredError("ChatGPT is not signed in yet. Sign in in the opened browser window, or run import-chrome-cookies, then call generate_image again."),
+    );
+  }
+
+  private cancelIdleClose(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+  }
+
+  private scheduleIdleClose(): void {
+    this.cancelIdleClose();
+    if (this.config.web.idleCloseSeconds <= 0 || !this.context) {
+      return;
+    }
+    this.idleTimer = setTimeout(() => {
+      if (this.busy || this.startup) {
+        this.scheduleIdleClose();
+        return;
+      }
+      console.error(`Closing idle ChatGPT browser after ${this.config.web.idleCloseSeconds}s.`);
+      void this.close();
+    }, this.config.web.idleCloseSeconds * 1000);
+    this.idleTimer.unref?.();
+  }
+
+  private watchReleaseRequests(): void {
+    clearInterval(this.releaseWatcher);
+    const releaseFile = releaseRequestPath(this.config.web.profileDir);
+    const ackFile = releaseAckPath(this.config.web.profileDir);
+    this.releaseWatcher = setInterval(() => {
+      if (!this.context) {
+        return;
+      }
+      void stat(releaseFile)
+        .then(async (info) => {
+          if (info.mtimeMs < this.launchedAt || Date.now() - info.mtimeMs > RELEASE_REQUEST_FRESH_MS) {
+            return;
+          }
+          await writeFile(ackFile, String(Date.now())).catch(() => undefined);
+          if (this.busy) {
+            return;
+          }
+          await rm(releaseFile, { force: true });
+          if (this.busy || !this.context) {
+            return;
+          }
+          console.error("Closing ChatGPT browser so another gpt-image-2 MCP session can use the profile.");
+          await this.close();
+        })
+        .catch(() => undefined);
+    }, 1000);
+    this.releaseWatcher.unref?.();
+  }
+
   async close(): Promise<void> {
+    this.cancelIdleClose();
+    clearInterval(this.releaseWatcher);
+    this.releaseWatcher = undefined;
     const context = this.context;
     this.context = undefined;
     this.page = undefined;
     this.chatReady = false;
     this.hideReady = false;
     this.hidden = false;
+    this.hideWindowEnabled = this.config.web.hideWindow;
+    this.lastReadinessReason = undefined;
     this.startup = undefined;
     this.blankPageCleanupContext = undefined;
     if (context) {
@@ -336,13 +513,24 @@ class DirectChatGptBrowserSession {
     }
   }
 
-  private async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.lock.then(fn, fn);
-    this.lock = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+  private async runExclusive<T>(signal: AbortSignal | undefined, deadline: number, task: () => Promise<T>): Promise<T> {
+    const previous = this.lock;
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => (release = resolve));
+    this.lock = previous.then(() => mine);
+    const queuedAt = Date.now();
+    try {
+      await raceDeadline(
+        previous,
+        deadline,
+        signal,
+        () => new Error(`Timed out after ${Math.round((Date.now() - queuedAt) / 1000)}s waiting for another image generation in this session to finish.`),
+      );
+      throwIfAborted(signal);
+      return await task();
+    } finally {
+      release();
+    }
   }
 
   private async ensureStarted(): Promise<void> {
@@ -351,44 +539,24 @@ class DirectChatGptBrowserSession {
       return;
     }
 
-    if (!this.browserOpen) {
-      await mkdir(this.config.web.profileDir, { recursive: true });
-      const profileOwner = await findBrowserProfileOwner(this.config.web.profileDir);
-      if (profileOwner) {
-        throw profileAlreadyOpenError(this.config.web.profileDir, profileOwner);
-      }
-      const commonOptions = {
-        headless: false,
-        acceptDownloads: true,
-        viewport: null,
-        ignoreDefaultArgs: ["about:blank"],
-      };
-
+    if (!this.browserOpen && this.context) {
       try {
-        this.context = await chromium.launchPersistentContext(this.config.web.profileDir, {
-          ...commonOptions,
-          channel: "chrome",
-        });
-      } catch (error) {
-        if (isExistingBrowserSessionError(error)) {
-          const owner = await findBrowserProfileOwner(this.config.web.profileDir);
-          throw profileAlreadyOpenError(this.config.web.profileDir, owner);
-        }
-        try {
-          this.context = await chromium.launchPersistentContext(this.config.web.profileDir, {
-            ...commonOptions,
-            executablePath: findChrome(),
-          });
-        } catch (fallbackError) {
-          if (isExistingBrowserSessionError(fallbackError)) {
-            const owner = await findBrowserProfileOwner(this.config.web.profileDir);
-            throw profileAlreadyOpenError(this.config.web.profileDir, owner);
-          }
-          throw fallbackError;
-        }
+        this.page = watchForCrash(await this.context.newPage());
+      } catch {
+        const stale = this.context;
+        this.context = undefined;
+        this.page = undefined;
+        await stale.close().catch(() => undefined);
       }
+    }
 
-      this.page = (await selectStartupPage(this.context)) || (await this.context.newPage());
+    if (!this.browserOpen) {
+      this.context = await launchProfileContext(this.config.web.profileDir);
+      this.launchedAt = Date.now();
+      await rm(releaseRequestPath(this.config.web.profileDir), { force: true }).catch(() => undefined);
+      this.watchReleaseRequests();
+
+      this.page = watchForCrash((await selectStartupPage(this.context)) || (await this.context.newPage()));
       this.installBlankPageCleanup(this.context);
       this.scheduleBlankPageCleanup("startup");
       this.hidden = false;
@@ -412,10 +580,10 @@ class DirectChatGptBrowserSession {
 
     if (!readiness?.hideReady) {
       console.error("ChatGPT browser opened. Log in or complete verification in that browser window.");
-      console.error("The MCP server will hide the browser after chatgpt.com shows the normal ChatGPT composer page.");
+      console.error("The MCP server will hide the browser after chatgpt.com shows a signed-in ChatGPT page.");
     }
 
-    await this.waitForComposerWithHide(page, this.config.web.loginTimeoutSeconds, "startup");
+    await this.waitForComposerWithHide(page, Date.now() + this.config.web.loginTimeoutSeconds * 1000, "startup");
     await this.closeExtraBlankPages("composer-ready");
     await this.hideWindowIfConfigured("login-complete");
   }
@@ -450,17 +618,20 @@ class DirectChatGptBrowserSession {
     }
   }
 
-  private async waitForComposerWithHide(page: Page, timeoutSeconds: number, reason: string): Promise<string> {
-    const deadline = Date.now() + timeoutSeconds * 1000;
+  private async waitForComposerWithHide(page: Page, deadline: number, reason: string, signal?: AbortSignal): Promise<string> {
     let lastReadiness: ChatPageReadiness | undefined;
     while (Date.now() < deadline) {
+      throwIfAborted(signal);
       try {
         await this.closeExtraBlankPages(`${reason}-poll`);
         lastReadiness = await chatPageReadiness(page);
         this.chatReady = lastReadiness.ready;
         this.hideReady = lastReadiness.hideReady;
+        this.lastReadinessReason = lastReadiness.reason;
         if (lastReadiness.hideReady) {
           await this.hideWindowIfConfigured(lastReadiness.hideReason || reason);
+        } else if (this.hidden) {
+          await this.showBrowserWindow();
         }
         if (lastReadiness.ready && lastReadiness.composerSelector) {
           return lastReadiness.composerSelector;
@@ -475,7 +646,7 @@ class DirectChatGptBrowserSession {
       throw new LoginRequiredError("Timed out waiting for ChatGPT verification. Complete verification/login faster, then run the command again.");
     }
     const detail = lastReadiness?.reason ? ` Last observed state: ${lastReadiness.reason}.` : "";
-    throw new LoginRequiredError(`Timed out waiting for ChatGPT login. Log in in the opened browser before the login timeout.${detail}`);
+    throw new LoginRequiredError(`Timed out waiting for a signed-in ChatGPT page. Sign in in the opened browser window, or run import-chrome-cookies, then call again.${detail}`);
   }
 
   private async refreshChatReadiness(reason: string): Promise<ChatPageReadiness | undefined> {
@@ -486,7 +657,13 @@ class DirectChatGptBrowserSession {
       return undefined;
     }
 
-    const readiness = await chatPageReadiness(this.page);
+    let readiness: ChatPageReadiness;
+    try {
+      readiness = await chatPageReadiness(this.page);
+    } catch {
+      this.chatReady = false;
+      return undefined;
+    }
     this.chatReady = readiness.ready;
     this.hideReady = readiness.hideReady;
     if (readiness.hideReady) {
@@ -578,6 +755,87 @@ function directStatusMessage(session: DirectSessionStatus): string {
   return "TypeScript ChatGPT browser automation is configured but has not started.";
 }
 
+export class ProfileInUseError extends BackendUnavailableError {
+  final = false;
+}
+
+const PROFILE_RETRY_MS = 3000;
+const RELEASE_REQUEST_FRESH_MS = 10_000;
+const RELEASE_ACK_TIMEOUT_MS = 10_000;
+const PROFILE_MIN_ATTEMPT_MS = 5000;
+
+function releaseRequestPath(profileDir: string): string {
+  return `${profileDir}.release-request`;
+}
+
+function releaseAckPath(profileDir: string): string {
+  return `${profileDir}.release-ack`;
+}
+
+export async function acquireProfile<T>(
+  profileDir: string,
+  deadline: number,
+  signal: AbortSignal | undefined,
+  attempt: () => Promise<T>,
+  onTimeout: () => Error,
+): Promise<T> {
+  const releaseFile = releaseRequestPath(profileDir);
+  const started = Date.now();
+  let requestedAt: number | undefined;
+  let lastProfileError: ProfileInUseError | undefined;
+  const waited = (error: ProfileInUseError) => {
+    const final = new ProfileInUseError(`Waited ${Math.round((Date.now() - started) / 1000)}s for the ChatGPT browser profile. ${error.message}`, "chatgpt-web");
+    final.final = true;
+    return final;
+  };
+  try {
+    for (;;) {
+      try {
+        return await raceDeadline(attempt(), deadline, signal, onTimeout);
+      } catch (error) {
+        if (!(error instanceof ProfileInUseError) || error.final) {
+          throw error;
+        }
+        lastProfileError = error;
+        if (requestedAt !== undefined && Date.now() - requestedAt > RELEASE_ACK_TIMEOUT_MS) {
+          const ack = await stat(releaseAckPath(profileDir)).catch(() => undefined);
+          if (!ack || ack.mtimeMs < requestedAt) {
+            throw new ProfileInUseError(
+              `The ChatGPT browser profile is held by a program that did not answer the gpt-image-2 hand-off request, so it is not an idle gpt-image-2 session (or it is a gpt-image-2 server started before an update; restart that client). Close the program using the profile, then call again. ${error.message}`,
+              "chatgpt-web",
+            );
+          }
+        }
+        if (Date.now() + PROFILE_RETRY_MS >= deadline) {
+          throw waited(error);
+        }
+        requestedAt ??= Date.now();
+        await writeFile(releaseFile, String(Date.now())).catch(() => undefined);
+        await raceDeadline(sleep(PROFILE_RETRY_MS), deadline, signal, () => waited(error));
+        if (deadline - Date.now() < PROFILE_MIN_ATTEMPT_MS) {
+          throw waited(error);
+        }
+      }
+    }
+  } finally {
+    if (requestedAt !== undefined) {
+      await rm(releaseFile, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
+function watchForCrash(page: Page): Page {
+  page.on("crash", () => {
+    console.error("The ChatGPT tab crashed; the next call opens a new tab.");
+    void page.close().catch(() => undefined);
+  });
+  return page;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 class LoginRequiredError extends Error {
   constructor(message: string) {
     super(message);
@@ -609,6 +867,45 @@ function findChrome(): string {
   throw new BackendUnavailableError("Chrome or Edge executable not found. Set CHROME_PATH to the browser executable.", "chatgpt-web");
 }
 
+export async function launchProfileContext(profileDir: string, headless = false): Promise<BrowserContext> {
+  await mkdir(profileDir, { recursive: true });
+  const profileOwner = await findBrowserProfileOwner(profileDir);
+  if (profileOwner) {
+    throw profileAlreadyOpenError(profileDir, profileOwner);
+  }
+  const commonOptions = {
+    headless,
+    chromiumSandbox: true,
+    acceptDownloads: true,
+    viewport: null,
+    ignoreDefaultArgs: ["about:blank"],
+  };
+
+  try {
+    return await chromium.launchPersistentContext(profileDir, {
+      ...commonOptions,
+      channel: "chrome",
+    });
+  } catch (error) {
+    const owner = await findBrowserProfileOwner(profileDir);
+    if (owner || isExistingBrowserSessionError(error)) {
+      throw profileAlreadyOpenError(profileDir, owner);
+    }
+    try {
+      return await chromium.launchPersistentContext(profileDir, {
+        ...commonOptions,
+        executablePath: findChrome(),
+      });
+    } catch (fallbackError) {
+      const fallbackOwner = await findBrowserProfileOwner(profileDir);
+      if (fallbackOwner || isExistingBrowserSessionError(fallbackError)) {
+        throw profileAlreadyOpenError(profileDir, fallbackOwner);
+      }
+      throw fallbackError;
+    }
+  }
+}
+
 async function findBrowserProfileOwner(profileDir: string): Promise<BrowserProfileOwner | undefined> {
   if (process.platform !== "win32") {
     return undefined;
@@ -618,7 +915,7 @@ async function findBrowserProfileOwner(profileDir: string): Promise<BrowserProfi
 $ErrorActionPreference = 'Stop'
 $profileDir = [System.IO.Path]::GetFullPath($env:CHATGPT_WEB_PROFILE_OWNER_DIR).TrimEnd('\\').ToLowerInvariant()
 $owner = Get-CimInstance Win32_Process -Filter "name = 'chrome.exe' OR name = 'msedge.exe'" |
-  Where-Object { $_.CommandLine -and $_.CommandLine.ToLowerInvariant().Contains($profileDir) } |
+  Where-Object { $_.CommandLine -and $_.CommandLine.ToLowerInvariant() -match ('--user-data-dir="?' + [regex]::Escape($profileDir) + '\\\\?("|\\s|$)') } |
   Sort-Object @{ Expression = { if ($_.CommandLine -match '\\s--type=') { 1 } else { 0 } } }, ProcessId |
   Select-Object -First 1 @{ Name = 'pid'; Expression = { $_.ProcessId } }, @{ Name = 'processName'; Expression = { $_.Name } }
 if ($owner) { $owner | ConvertTo-Json -Compress }
@@ -651,8 +948,8 @@ if ($owner) { $owner | ConvertTo-Json -Compress }
 
 function profileAlreadyOpenError(profileDir: string, owner?: BrowserProfileOwner): BackendUnavailableError {
   const ownerText = owner ? `${owner.processName} PID ${owner.pid}` : "another Chrome or Edge process";
-  return new BackendUnavailableError(
-    `The ChatGPT browser profile is already open in ${ownerText}. The MCP did not launch another browser because Chrome would add extra about:blank tabs to the existing profile. Close the existing MCP Chrome window, then restart Codex or call the MCP again. Profile: ${profileDir}`,
+  return new ProfileInUseError(
+    `The ChatGPT browser profile is already open in ${ownerText}, usually another gpt-image-2 MCP session from another client. A gpt-image-2 session hands the profile over when it is not generating; any other program using the profile has to be closed. Profile: ${profileDir}`,
     "chatgpt-web",
   );
 }
@@ -806,8 +1103,25 @@ async function pageState(page: Page): Promise<PageState> {
   return (await page.evaluate(() => ({
     title: document.title,
     url: location.href,
-    text: (document.body?.innerText || "").slice(0, 3000),
+    challenge: Boolean(document.querySelector('iframe[src*="challenges.cloudflare.com"], #challenge-form, #challenge-stage')),
   }))) as PageState;
+}
+
+export function looksBlocked(state: Pick<PageState, "title" | "url" | "challenge">): boolean {
+  return Boolean(state.challenge) || /^(?:just a moment\.*|attention required! \| cloudflare)$/i.test(state.title.trim()) || /\/cdn-cgi\/challenge/i.test(state.url);
+}
+
+async function isSignedIn(page: Page): Promise<boolean> {
+  try {
+    return (await page.evaluate(async () => {
+      const response = await fetch("/api/auth/session", { credentials: "include", signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) return false;
+      const session = await response.json().catch(() => null);
+      return Boolean(session && session.user);
+    })) as boolean;
+  } catch {
+    return false;
+  }
 }
 
 async function markBestComposer(page: Page): Promise<string | null> {
@@ -827,17 +1141,14 @@ async function markBestComposer(page: Page): Promise<string | null> {
       .sort((a, b) => score(b) - score(a));
     const chosen = candidates[0];
     if (!chosen) return null;
-    const token = "chatgpt-image-composer-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    const existing = chosen.getAttribute("data-chatgpt-image-composer");
+    const token = existing || "chatgpt-image-composer-" + Date.now() + "-" + Math.random().toString(36).slice(2);
     chosen.setAttribute("data-chatgpt-image-composer", token);
     return '[data-chatgpt-image-composer="' + token + '"]';
   })) as string | null;
 }
 
-async function composerSelectorIfReady(page: Page): Promise<string | null> {
-  return markBestComposer(page);
-}
-
-function isChatGptChatPageUrl(value: string): boolean {
+export function isChatGptChatPageUrl(value: string): boolean {
   try {
     const url = new URL(value);
     if (!isChatGptUrl(value)) {
@@ -850,7 +1161,7 @@ function isChatGptChatPageUrl(value: string): boolean {
   }
 }
 
-async function chatPageReadiness(page: Page): Promise<ChatPageReadiness> {
+export async function chatPageReadiness(page: Page): Promise<ChatPageReadiness> {
   const state = await pageState(page);
   if (!isChatGptChatPageUrl(state.url)) {
     return { ready: false, hideReady: false, state, reason: "not-chatgpt-chat-url" };
@@ -858,161 +1169,188 @@ async function chatPageReadiness(page: Page): Promise<ChatPageReadiness> {
   if (looksBlocked(state)) {
     return { ready: false, hideReady: false, state, reason: "verification-or-security-check" };
   }
-  const composerSelector = await composerSelectorIfReady(page);
-  const authenticatedShell = looksAuthenticatedChatShell(state);
+  if (!(await isSignedIn(page))) {
+    return { ready: false, hideReady: false, state, reason: "not-signed-in" };
+  }
+  const composerSelector = await markBestComposer(page);
   if (composerSelector) {
     return { ready: true, hideReady: true, composerSelector, state, hideReason: "composer-visible" };
   }
-  if (authenticatedShell) {
-    return { ready: false, hideReady: true, state, reason: "composer-not-visible", hideReason: "authenticated-chat-shell" };
-  }
-  if (looksLikeLoginPrompt(state)) {
-    return { ready: false, hideReady: false, state, reason: "login-prompt-visible" };
-  }
-  return { ready: false, hideReady: false, state, reason: "composer-not-visible" };
+  return { ready: false, hideReady: true, state, reason: "composer-not-visible", hideReason: "signed-in" };
 }
 
-async function chatPageReady(page: Page): Promise<boolean> {
-  return (await chatPageReadiness(page)).ready;
-}
-
-function looksAuthenticatedChatShell(state: PageState): boolean {
-  const haystack = `${state.title}\n${state.text}`;
-  const markers = [
-    /\bnew chat\b/i,
-    /\bsearch chats\b/i,
-    /\blibrary\b/i,
-    /\brecents\b/i,
-    /\bgpts\b/i,
-    /\bprojects\b/i,
-    /\bask anything\b/i,
-    /\bwhat are you working on\?/i,
-    /chatgpt can make mistakes/i,
-  ];
-  return markers.filter((marker) => marker.test(haystack)).length >= 2;
-}
-
-function looksLikeLoginPrompt(state: PageState): boolean {
-  const haystack = `${state.title}\n${state.url}\n${state.text}`;
-  return /continue with google|continue with apple|email address|log in|sign up/i.test(haystack);
-}
-
-function looksBlocked(state: PageState): boolean {
-  const haystack = `${state.title}\n${state.url}\n${state.text}`;
-  return /verify you are human|just a moment|captcha|cloudflare|security check/i.test(haystack);
-}
-
-function generationFailureReason(state: PageState): string | null {
-  const text = state.text || "";
+export function generationFailureReason(text: string): string | null {
   const patterns = [
-    /image we created may violate our guardrails/i,
-    /may violate our guardrails/i,
+    /may violate our (?:guardrails|content policies|policies)/i,
     /similarity to third-party content/i,
-    /we're so sorry/i,
-    /we(?: are|'re) unable to generate/i,
-    /couldn(?:'|')t generate/i,
-    /could not generate/i,
-    /cannot generate/i,
-    /can(?:not|'t) create/i,
+    /we(?: are|['’]re) unable to generate/i,
+    /(?:couldn['’]t|could not|can(?:not|['’]t)) (?:generate|create)/i,
     /unable to create/i,
     /this request (?:may )?violate/i,
-    /content policy/i,
+    /content polic(?:y|ies)/i,
+    /(?:hit|reached) (?:the|your) .{0,40}limit/i,
+    /try again (?:later|in|after|tomorrow)/i,
   ];
   for (const pattern of patterns) {
-    const match = pattern.exec(text);
-    if (!match) {
-      continue;
+    if (pattern.test(text)) {
+      return pattern.source;
     }
-    const start = Math.max(0, match.index - 180);
-    const end = Math.min(text.length, match.index + match[0].length + 360);
-    return text.slice(start, end).replace(/\s+/g, " ").trim();
   }
   return null;
 }
 
-async function waitForComposer(page: Page, timeoutSeconds: number): Promise<string> {
-  const deadline = Date.now() + timeoutSeconds * 1000;
+async function waitForComposer(page: Page, deadline: number, signal?: AbortSignal, onBlocked?: () => Promise<void>): Promise<string> {
   let lastReadiness: ChatPageReadiness | undefined;
-  while (Date.now() < deadline) {
+  do {
+    throwIfAborted(signal);
     try {
       lastReadiness = await chatPageReadiness(page);
       if (lastReadiness.ready && lastReadiness.composerSelector) {
         return lastReadiness.composerSelector;
       }
+      if (lastReadiness.state && looksBlocked(lastReadiness.state)) {
+        await onBlocked?.();
+      }
     } catch {
       lastReadiness = undefined;
     }
-    await page.waitForTimeout(2000);
-  }
+    await page.waitForTimeout(1000);
+  } while (Date.now() < deadline);
 
   if (lastReadiness?.state && looksBlocked(lastReadiness.state)) {
-    throw new LoginRequiredError("Timed out waiting for ChatGPT verification. Complete verification/login faster, then run the command again.");
+    throw new LoginRequiredError("Timed out waiting for ChatGPT verification. Complete the check in the ChatGPT browser window (browser_visibility show displays it), then call again.");
   }
   const detail = lastReadiness?.reason ? ` Last observed state: ${lastReadiness.reason}.` : "";
-  throw new LoginRequiredError(`Timed out waiting for ChatGPT login. Log in in the opened browser before the login timeout.${detail}`);
+  throw new LoginRequiredError(`Timed out waiting for the ChatGPT composer.${detail}`);
 }
 
-async function openNewChat(page: Page): Promise<void> {
-  await waitForComposer(page, 30);
-  const selector = (await page.evaluate(() => {
-    const visible = (el: Element) => {
-      const r = el.getBoundingClientRect();
-      const s = getComputedStyle(el);
-      return r.width >= 20 && r.height >= 20 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
-    };
-    const candidates = Array.from(document.querySelectorAll("a,button"))
-      .filter(visible)
-      .filter((el) => {
-        const label = String((el.getAttribute("aria-label") || "") + " " + (el.textContent || "")).trim().toLowerCase();
-        return /^new chat$/.test(label) || label.includes("new chat");
-      });
-    const chosen = candidates[0];
-    if (!chosen) return null;
-    const token = "chatgpt-image-new-chat-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-    chosen.setAttribute("data-chatgpt-image-new-chat", token);
-    return '[data-chatgpt-image-new-chat="' + token + '"]';
-  })) as string | null;
-  if (selector) {
-    await page.locator(selector).first().click({ force: true });
-    await page.waitForTimeout(1500);
-  } else {
-    await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded", timeout: 90_000 });
-    await page.waitForTimeout(1500);
+export function isConversationUrl(value: string): boolean {
+  try {
+    return isChatGptUrl(value) && /\/c\/[^/]+/.test(new URL(value).pathname);
+  } catch {
+    return false;
   }
-  await waitForComposer(page, 30);
+}
+
+async function gotoWithinDeadline(page: Page, url: string, deadline: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  const timeout = Math.max(1000, Math.min(90_000, deadline - Date.now()));
+  await raceDeadline(page.goto(url, { waitUntil: "domcontentloaded", timeout }), deadline + 1000, signal, () => new Error(`Timed out loading ${url}.`));
+}
+
+async function waitForStableThread(page: Page, deadline: number, signal?: AbortSignal): Promise<boolean> {
+  const until = Math.min(deadline, Date.now() + 15_000);
+  let last = "";
+  let stableSince = Date.now();
+  while (Date.now() < until) {
+    throwIfAborted(signal);
+    const snapshot = await turnSnapshot(page);
+    const images = (await collectImages(page)).map((image) => image.src).join("|");
+    const key = `${snapshot.responseCount}:${snapshot.userCount}:${images}`;
+    if (key !== last) {
+      last = key;
+      stableSince = Date.now();
+    } else if (snapshot.responseCount + snapshot.userCount > 0 && Date.now() - stableSince >= 2000) {
+      return true;
+    }
+    await page.waitForTimeout(250);
+  }
+  return false;
+}
+
+async function waitWhileStreaming(page: Page, deadline: number, signal?: AbortSignal): Promise<boolean> {
+  while (isStreaming(await turnSnapshot(page))) {
+    throwIfAborted(signal);
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await page.waitForTimeout(1000);
+  }
+  return true;
+}
+
+function withConversation(message: string, page: Page): string {
+  const url = safePageUrl(page);
+  return isConversationUrl(url) ? `${message} Conversation: ${url}` : message;
+}
+
+interface TurnSnapshot {
+  turnState: string | null;
+  legacyStreaming: boolean;
+  responseCount: number;
+  userCount: number;
+  lastResponseText: string;
+  lastResponseHasImage: boolean;
+}
+
+async function turnSnapshot(page: Page): Promise<TurnSnapshot> {
+  return (await page.evaluate(() => {
+    const states = Array.from(document.querySelectorAll("[data-talvt-turn-state]"));
+    let responses = Array.from(document.querySelectorAll("[data-response-body]"));
+    if (responses.length === 0) {
+      responses = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+    }
+    const last = responses[responses.length - 1] as HTMLElement | undefined;
+    return {
+      turnState: states.length ? states[states.length - 1].getAttribute("data-talvt-turn-state") : null,
+      legacyStreaming: Boolean(document.querySelector('[data-testid="stop-button"]')),
+      responseCount: responses.length,
+      userCount: document.querySelectorAll('[data-user-message-bubble], [data-message-author-role="user"]').length,
+      lastResponseText: (last?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 600),
+      lastResponseHasImage: Boolean(last?.querySelector('[data-testid="generated-image-gallery"] img, img[alt^="Generated image"]')),
+    };
+  })) as TurnSnapshot;
+}
+
+function isStreaming(snapshot: TurnSnapshot): boolean {
+  return snapshot.turnState === "in_progress" || snapshot.legacyStreaming;
 }
 
 async function collectImages(page: Page): Promise<BrowserImage[]> {
   return (await page.evaluate(() => {
-    const visible = (el: Element) => {
-      const r = el.getBoundingClientRect();
-      const s = getComputedStyle(el);
-      return r.width >= 160 && r.height >= 160 && s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+    const toImage = (img: Element) => {
+      const image = img as HTMLImageElement;
+      const r = img.getBoundingClientRect();
+      return {
+        src: image.currentSrc || image.src,
+        alt: image.alt || "",
+        naturalWidth: image.naturalWidth || 0,
+        naturalHeight: image.naturalHeight || 0,
+        displayWidth: Math.round(r.width),
+        displayHeight: Math.round(r.height),
+      };
     };
-    return Array.from(document.querySelectorAll("main img"))
-      .filter(visible)
-      .map((img) => {
-        const image = img as HTMLImageElement;
-        const r = img.getBoundingClientRect();
-        return {
-          src: image.currentSrc || image.src,
-          alt: image.alt || "",
-          naturalWidth: image.naturalWidth || 0,
-          naturalHeight: image.naturalHeight || 0,
-          displayWidth: Math.round(r.width),
-          displayHeight: Math.round(r.height)
-        };
-      })
+    const generated = Array.from(document.querySelectorAll('[data-testid="generated-image-gallery"] img, main img[alt^="Generated image"]'));
+    const pool = generated.length
+      ? generated
+      : Array.from(document.querySelectorAll("main img")).filter((img) => {
+          const r = img.getBoundingClientRect();
+          const image = img as HTMLImageElement;
+          return (
+            r.width >= 160 &&
+            r.height >= 160 &&
+            !image.src.startsWith("data:") &&
+            !/user attachment|avatar|profile|icon|logo/i.test(image.alt || "") &&
+            !img.closest('[data-user-message-bubble], [data-message-author-role="user"], [data-composer-attachments]')
+          );
+        });
+    const seen = new Set<string>();
+    return pool
+      .map(toImage)
       .filter((img) => img.src && img.naturalWidth >= 256 && img.naturalHeight >= 256)
-      .filter((img) => !/avatar|profile|icon|logo/i.test(img.alt));
+      .filter((img) => (seen.has(img.src) ? false : (seen.add(img.src), true)));
   })) as BrowserImage[];
 }
 
 async function readComposerText(page: Page, selector: string): Promise<string> {
-  return (await page
-    .locator(selector)
-    .first()
-    .evaluate((el) => (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : el.textContent || ""))) as string;
+  try {
+    return (await page
+      .locator(selector)
+      .first()
+      .evaluate((el) => (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : el.textContent || ""), undefined, { timeout: 5000 })) as string;
+  } catch {
+    return "";
+  }
 }
 
 async function clickSendNear(page: Page, composerSelector: string): Promise<void> {
@@ -1030,13 +1368,15 @@ async function clickSendNear(page: Page, composerSelector: string): Promise<void
       const sy = sr.top + sr.height / 2;
       const candidates = Array.from(document.querySelectorAll("button"))
         .filter((button) => visible(button) && !button.disabled && button.getAttribute("aria-disabled") !== "true")
+        .filter((button) => {
+          const label = String((button.getAttribute("aria-label") || "") + " " + (button.getAttribute("data-testid") || "")).toLowerCase();
+          return /send|submit/.test(label);
+        })
         .map((button) => {
           const r = button.getBoundingClientRect();
-          const label = String((button.getAttribute("aria-label") || "") + " " + (button.textContent || "")).toLowerCase();
           return {
             button,
-            dist: Math.hypot(r.left + r.width / 2 - sx, r.top + r.height / 2 - sy) +
-              (/send|submit|up arrow/.test(label) ? -300 : 0)
+            dist: Math.hypot(r.left + r.width / 2 - sx, r.top + r.height / 2 - sy),
           };
         })
         .sort((a, b) => a.dist - b.dist);
@@ -1053,10 +1393,28 @@ async function clickSendNear(page: Page, composerSelector: string): Promise<void
   }
 }
 
+async function attachReferenceImages(page: Page, paths: string[], deadline: number, signal?: AbortSignal): Promise<void> {
+  const input = page.locator('input[type="file"]').first();
+  if ((await input.count()) === 0) {
+    throw new Error("The ChatGPT page has no file upload input, so reference images cannot be attached.");
+  }
+  const before = await page.locator("[data-composer-attachments] img").count();
+  await input.setInputFiles(paths);
+  const attachDeadline = Math.min(deadline, Date.now() + 60_000);
+  while (Date.now() < attachDeadline) {
+    throwIfAborted(signal);
+    if ((await page.locator("[data-composer-attachments] img").count()) >= before + paths.length) {
+      return;
+    }
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`Timed out waiting for ${paths.length} reference image(s) to attach in ChatGPT.`);
+}
+
 async function exportImageFromSrc(page: Page, image: BrowserImage, outputDir: string, index: number): Promise<GeneratedImage> {
   const payload = (await page.evaluate(
     async (src) => {
-      const response = await fetch(src);
+      const response = await fetch(src, { signal: AbortSignal.timeout(60_000) });
       if (!response.ok) throw new Error("fetch failed " + response.status);
       const blob = await response.blob();
       const dataUrl = await new Promise((resolve, reject) => {
@@ -1085,33 +1443,91 @@ async function exportImageFromSrc(page: Page, image: BrowserImage, outputDir: st
     mimeType,
     width: image.naturalWidth,
     height: image.naturalHeight,
-    sourceUrl: image.src,
   };
 }
-async function sendPromptAndExport(
-  page: Page,
-  config: AppConfig,
-  params: {
-    prompt: string;
-    timeoutSeconds: number;
-    maxImages: number;
-    conversationMode: "new" | "continue";
-    sessionReused: boolean;
-  },
-): Promise<GenerateImageResult> {
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new Error("Image generation was cancelled.");
+  }
+}
+
+async function raceDeadline<T>(work: Promise<T>, deadline: number, signal: AbortSignal | undefined, onTimeout: () => Error): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(onTimeout()), Math.max(0, deadline - Date.now()));
+        onAbort = () => reject(new Error("Image generation was cancelled."));
+        if (signal?.aborted) onAbort();
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+export interface SendPromptParams {
+  prompt: string;
+  deadline: number;
+  maxImages: number;
+  conversationMode: "new" | "continue";
+  conversationUrl?: string;
+  referenceImages?: string[];
+  signal?: AbortSignal;
+  onBlocked?: () => Promise<void>;
+  completedTurnGraceMs?: number;
+}
+
+export async function sendPromptAndExport(page: Page, config: AppConfig, params: SendPromptParams): Promise<GenerateImageResult> {
   const prompt = params.prompt.trim();
   if (!prompt) {
     throw new Error("Prompt cannot be empty.");
   }
+  const { deadline, signal } = params;
+  const graceMs = params.completedTurnGraceMs ?? 8000;
+  const warnings: string[] = [];
 
-  const outputDir = await createOutputDir(config.outputRoot, prompt);
-  if (params.conversationMode === "new") {
-    await openNewChat(page);
-  } else {
-    await waitForComposer(page, 30);
+  if (params.conversationUrl) {
+    if (!isConversationUrl(params.conversationUrl)) {
+      throw new Error(`conversation_url must be a chatgpt.com conversation URL: ${params.conversationUrl}`);
+    }
+    if (safePageUrl(page) !== params.conversationUrl) {
+      await gotoWithinDeadline(page, params.conversationUrl, deadline, signal);
+    }
+  } else if (params.conversationMode === "new") {
+    await gotoWithinDeadline(page, CHATGPT_URL, deadline, signal);
   }
-  const composerSelector = await waitForComposer(page, 30);
+  await page.keyboard.press("Escape").catch(() => undefined);
+  let composerSelector = await waitForComposer(page, deadline, signal, params.onBlocked);
+  const continuing = Boolean(params.conversationUrl) || params.conversationMode === "continue";
+  if (continuing) {
+    if (isConversationUrl(safePageUrl(page))) {
+      if (!(await waitForStableThread(page, deadline, signal))) {
+        warnings.push("The ChatGPT conversation history did not finish loading before the prompt was sent.");
+      }
+      if (!(await waitWhileStreaming(page, deadline, signal))) {
+        throw new Error(withConversation("The previous ChatGPT reply in this conversation was still generating at the deadline, so the prompt was not sent. Use collect_images to save it.", page));
+      }
+    } else {
+      warnings.push("No ChatGPT conversation was open to continue, so the prompt started a new chat.");
+    }
+  }
+
+  if (params.referenceImages?.length) {
+    await attachReferenceImages(page, params.referenceImages, deadline, signal);
+    composerSelector = await waitForComposer(page, deadline, signal, params.onBlocked);
+  }
   const knownSources = new Set((await collectImages(page)).map((image) => image.src));
+  const baseline = await turnSnapshot(page);
+  throwIfAborted(signal);
+  if (Date.now() >= deadline) {
+    throw new Error(withConversation("The time limit ran out before the prompt could be sent, so it was not sent.", page));
+  }
 
   const composer = page.locator(composerSelector).first();
   await composer.click({ force: true });
@@ -1128,68 +1544,144 @@ async function sendPromptAndExport(
     await clickSendNear(page, composerSelector);
   }
 
-  const deadline = Date.now() + params.timeoutSeconds * 1000;
   let exported: GeneratedImage[] = [];
-  while (Date.now() < deadline) {
+  let outputDir = "";
+  let completedWithoutImageSince: number | undefined;
+  while (true) {
+    throwIfAborted(signal);
     const state = await pageState(page);
     if (looksBlocked(state)) {
+      await params.onBlocked?.();
+      if (Date.now() >= deadline) {
+        throw new LoginRequiredError(withConversation("ChatGPT is showing a verification check. Complete it in the ChatGPT browser window (browser_visibility show displays it), then call again.", page));
+      }
       await page.waitForTimeout(2500);
       continue;
     }
 
-    const failureReason = generationFailureReason(state);
-    if (failureReason) {
-      const diagnostic = path.join(outputDir, "diagnostic-refusal.png");
-      await page.screenshot({ path: diagnostic, fullPage: true });
-      throw new ImageGenerationRefusedError(`${failureReason} Diagnostic screenshot: ${diagnostic}`);
-    }
-
+    const snapshot = await turnSnapshot(page);
     const fresh = (await collectImages(page)).filter((image) => !knownSources.has(image.src));
-    if (fresh.length === 0) {
-      await page.waitForTimeout(2500);
-      continue;
+    const streaming = isStreaming(snapshot);
+    const expired = Date.now() >= deadline;
+
+    if (fresh.length > 0 && (!streaming || expired)) {
+      if (streaming) {
+        warnings.push("The ChatGPT turn had not finished at the deadline, so the saved image may be a preview.");
+      } else {
+        await page.waitForTimeout(1500);
+      }
+      const finalFresh = (await collectImages(page)).filter((image) => !knownSources.has(image.src));
+      const selected = (finalFresh.length > 0 ? finalFresh : fresh).slice(-params.maxImages);
+      outputDir = await createOutputDir(config.outputRoot, prompt);
+      exported = await exportImages(page, selected, outputDir);
+      break;
     }
 
-    await page.waitForTimeout(1500);
-    const finalFresh = (await collectImages(page)).filter((image) => !knownSources.has(image.src));
-    const selected = (finalFresh.length > 0 ? finalFresh : fresh)
-      .sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)
-      .slice(0, params.maxImages);
+    const newResponse = snapshot.responseCount > baseline.responseCount;
+    if (fresh.length === 0 && newResponse && snapshot.turnState === "complete") {
+      completedWithoutImageSince ??= Date.now();
+      if (Date.now() - completedWithoutImageSince >= graceMs) {
+        const reply = snapshot.lastResponseText || "(empty reply)";
+        if (generationFailureReason(reply)) {
+          throw new ImageGenerationRefusedError(withConversation(`ChatGPT did not create an image: ${reply}`, page));
+        }
+        throw new Error(withConversation(`ChatGPT replied without an image: ${reply}`, page));
+      }
+    } else {
+      completedWithoutImageSince = undefined;
+    }
 
-    exported = await Promise.all(selected.map((image, index) => exportImageFromSrc(page, image, outputDir, index + 1)));
-    break;
+    if (expired) {
+      const diagnosticDir = await createOutputDir(config.outputRoot, prompt);
+      const diagnostic = path.join(diagnosticDir, "diagnostic-timeout.png");
+      await page.screenshot({ path: diagnostic }).catch(() => undefined);
+      throw new Error(withConversation(`Timed out waiting for an image; collect_images can fetch it later if ChatGPT finishes. Diagnostic screenshot: ${diagnostic}.`, page));
+    }
+    await page.waitForTimeout(1000);
   }
 
-  if (exported.length === 0) {
-    const diagnostic = path.join(outputDir, "diagnostic-timeout.png");
-    await page.screenshot({ path: diagnostic, fullPage: true });
-    throw new Error(`Timed out waiting for an image. Diagnostic screenshot: ${diagnostic}`);
-  }
+  return saveWebResult(outputDir, exported, page, {
+    prompt,
+    conversationMode: continuing ? "continue" : "new",
+    referenceImages: params.referenceImages ?? [],
+    warnings,
+  });
+}
 
-  const metadata = {
+async function exportImages(page: Page, images: BrowserImage[], outputDir: string): Promise<GeneratedImage[]> {
+  const results = await Promise.allSettled(images.map((image, index) => exportImageFromSrc(page, image, outputDir, index + 1)));
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure) {
+    await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
+    throw failure.reason;
+  }
+  return results.map((result) => (result as PromiseFulfilledResult<GeneratedImage>).value);
+}
+
+async function saveWebResult(
+  outputDir: string,
+  images: GeneratedImage[],
+  page: Page,
+  info: { prompt: string; conversationMode: string; referenceImages: string[]; warnings: string[] },
+): Promise<GenerateImageResult> {
+  const conversationUrl = safePageUrl(page);
+  await writeMetadata(outputDir, {
     backend: "chatgpt-web",
     mode: "direct-typescript-browser",
-    prompt,
+    prompt: info.prompt,
     created_at: new Date().toISOString(),
-    images: exported,
-    session_reused: params.sessionReused,
-    conversation_mode: params.conversationMode,
-    profile_dir: config.web.profileDir,
-  };
-  await writeMetadata(outputDir, metadata);
-
+    images,
+    conversation_mode: info.conversationMode,
+    conversation_url: conversationUrl,
+    reference_images: info.referenceImages,
+    warnings: info.warnings,
+  });
   return {
     status: "saved",
     backend: "chatgpt-web",
-    prompt,
+    prompt: info.prompt,
     outputDir,
-    images: exported,
-    primaryImage: exported[0],
+    images,
+    primaryImage: images[0],
+    warnings: info.warnings,
     metadata: {
       mode: "direct-typescript-browser",
-      session_reused: params.sessionReused,
-      conversation_mode: params.conversationMode,
-      profile_dir: config.web.profileDir,
+      conversation_mode: info.conversationMode,
+      conversation_url: conversationUrl,
     },
   };
+}
+
+export async function collectConversationImages(
+  page: Page,
+  config: AppConfig,
+  params: { conversationUrl: string; deadline: number; maxImages: number; signal?: AbortSignal; onBlocked?: () => Promise<void> },
+): Promise<GenerateImageResult> {
+  const { deadline, signal } = params;
+  if (!isConversationUrl(params.conversationUrl)) {
+    throw new Error(`conversation_url must be a chatgpt.com conversation URL: ${params.conversationUrl}`);
+  }
+  if (safePageUrl(page) !== params.conversationUrl) {
+    await gotoWithinDeadline(page, params.conversationUrl, deadline, signal);
+  }
+  await waitForComposer(page, deadline, signal, params.onBlocked);
+  const warnings: string[] = [];
+  if (!(await waitForStableThread(page, deadline, signal))) {
+    warnings.push("The ChatGPT conversation history did not finish loading.");
+  }
+  if (!(await waitWhileStreaming(page, deadline, signal))) {
+    throw new Error(withConversation("ChatGPT is still generating the latest reply; call collect_images again later.", page));
+  }
+  const latest = await turnSnapshot(page);
+  const images = (await collectImages(page)).slice(-params.maxImages);
+  if (images.length === 0) {
+    throw new Error(withConversation(["The ChatGPT conversation has no generated images.", ...warnings].join(" "), page));
+  }
+  if (!latest.lastResponseHasImage) {
+    warnings.push(`The latest ChatGPT reply has no image (${latest.lastResponseText || "empty reply"}); saved the most recent earlier image instead.`);
+  }
+  const prompt = `collected from ${params.conversationUrl}`;
+  const outputDir = await createOutputDir(config.outputRoot, "collected");
+  const exported = await exportImages(page, images, outputDir);
+  return saveWebResult(outputDir, exported, page, { prompt, conversationMode: "collect", referenceImages: [], warnings });
 }

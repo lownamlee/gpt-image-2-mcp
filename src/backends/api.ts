@@ -1,4 +1,7 @@
-import OpenAI from "openai";
+import { readFile, rm } from "node:fs/promises";
+import path from "node:path";
+
+import OpenAI, { toFile } from "openai";
 
 import type { AppConfig } from "../config.js";
 import { createOutputDir, mimeTypeForFormat, writeBase64Image, writeMetadata } from "../output.js";
@@ -42,8 +45,8 @@ export class ApiImageBackend implements ImageBackend {
       throw new BackendUnavailableError("OPENAI_API_KEY is not set.", this.name);
     }
 
-    const client = new OpenAI({ apiKey: this.config.api.apiKey });
-    const request: ImageGenerateRequest = {
+    const client = new OpenAI({ apiKey: this.config.api.apiKey, timeout: args.timeoutSeconds * 1000, maxRetries: 0 });
+    const request = {
       model: this.config.api.model,
       prompt: args.prompt,
       n: args.n,
@@ -51,7 +54,19 @@ export class ApiImageBackend implements ImageBackend {
       quality: args.quality || "auto",
       output_format: args.outputFormat,
     };
-    const response = (await client.images.generate(request)) as ImageResponse;
+    const requestOptions = { signal: args.signal };
+    const referenceImages = args.referenceImages ?? [];
+    const response = (
+      referenceImages.length > 0
+        ? await client.images.edit(
+            {
+              ...request,
+              image: await Promise.all(referenceImages.map(async (file) => toFile(await readFile(file), path.basename(file), { type: mimeTypeForPath(file) }))),
+            } as Parameters<OpenAI["images"]["edit"]>[0],
+            requestOptions,
+          )
+        : await client.images.generate(request as ImageGenerateRequest, requestOptions)
+    ) as ImageResponse;
 
     const items = response.data || [];
     if (items.length === 0) {
@@ -62,26 +77,33 @@ export class ApiImageBackend implements ImageBackend {
     const mimeType = mimeTypeForFormat(args.outputFormat);
     const images = [];
 
-    for (const [index, item] of items.entries()) {
-      const base64 = item.b64_json || (item.url ? await fetchImageAsBase64(item.url) : undefined);
-      if (!base64) {
-        throw new Error("OpenAI image API returned an image without b64_json or url.");
-      }
-      images.push({
-        path: await writeBase64Image({
-          base64,
-          outputDir,
-          index: index + 1,
+    try {
+      for (const [index, item] of items.entries()) {
+        const base64 = item.b64_json || (item.url ? await fetchImageAsBase64(item.url) : undefined);
+        if (!base64) {
+          throw new Error("OpenAI image API returned an image without b64_json or url.");
+        }
+        images.push({
+          path: await writeBase64Image({
+            base64,
+            outputDir,
+            index: index + 1,
+            mimeType,
+          }),
           mimeType,
-        }),
-        mimeType,
-      });
+        });
+      }
+    } catch (error) {
+      await rm(outputDir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
     }
 
     const metadata = {
       backend: this.name,
       model: this.config.api.model,
       prompt: args.prompt,
+      request: { n: args.n, size: request.size, quality: request.quality, output_format: args.outputFormat, reference_images: referenceImages },
+      revised_prompts: items.map((item) => item.revised_prompt).filter(Boolean),
       created_at: new Date().toISOString(),
       openai_created: response.created,
       usage: response.usage,
@@ -103,6 +125,11 @@ export class ApiImageBackend implements ImageBackend {
       },
     };
   }
+}
+
+function mimeTypeForPath(file: string): string {
+  const ext = path.extname(file).toLowerCase();
+  return ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : "image/png";
 }
 
 async function fetchImageAsBase64(url: string): Promise<string> {

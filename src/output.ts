@@ -39,9 +39,19 @@ export function extensionForMimeType(mimeType: string): string {
 }
 
 export async function createOutputDir(outputRoot: string, prompt: string): Promise<string> {
-  const outputDir = path.join(outputRoot, `${nowSlug()}-${safeSlug(prompt)}`);
-  await mkdir(outputDir, { recursive: true });
-  return outputDir;
+  await mkdir(outputRoot, { recursive: true });
+  const base = path.join(outputRoot, `${nowSlug()}-${safeSlug(prompt)}`);
+  for (let attempt = 1; ; attempt += 1) {
+    const outputDir = attempt === 1 ? base : `${base}-${attempt}`;
+    try {
+      await mkdir(outputDir);
+      return outputDir;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
 }
 
 export async function writeBase64Image(params: {
